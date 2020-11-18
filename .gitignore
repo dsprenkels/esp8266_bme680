@@ -51,9 +51,6 @@ Module.symvers
 Mkfile.old
 dkms.conf
 
-# ESP8266 sdk
-ESP8266_RTOS_SDK/
-
 # Python venv
 .env/
 .venv/
