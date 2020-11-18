@@ -1,0 +1,21 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/build/include",
+                "${workspaceFolder}/**",
+                "${workspaceFolder}/ESP8266_RTOS_SDK/components/esp8266/include",
+                "${workspaceFolder}/ESP8266_RTOS_SDK/components/freertos/port/esp8266/include",
+            ],
+            "defines": [],
+            "compilerPath": "/opt/xtensa-lx106-elf-gcc/bin/xtensa-lx106-elf-gcc",
+            "cStandard": "c11",
+            "cppStandard": "c++14",
+            "intelliSenseMode": "gcc-x64",
+            "compilerArgs": ["-D__ESP_FILE__=__FILE__"],
+        }
+    ],
+    "version": 4
+}
+
