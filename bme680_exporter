@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+
+import base64
+import datetime
+import hashlib
+import hmac
+import http.server
+import socket
+import struct
+import sys
+import threading
+
+# Use the same key here as in config.lua
+PRESHARED_KEY = base64.decodebytes(b'SECRET_KEY')
+
+# After a timeout of x SECONDS, assume the device is down
+DEVICE_LOST_SECONDS = 10
+
+_state = {}
+_last_updated = None
+_state_lock = threading.Lock()
+
+class BadPacketError(Exception):
+    pass
+
+class UDPListener(object):
+    @staticmethod
+    def authenticate_message(message):
+        if len(message) < 32:
+            return None
+
+        payload = message[:-32]
+        mac = message[-32:]
+        actual_mac = hmac.HMAC(PRESHARED_KEY, payload, hashlib.sha256).digest()
+        if not hmac.compare_digest(mac, actual_mac):
+            return None
+        return payload
+
+    @staticmethod
+    def unpack_message(payload):
+        version = None
+        try:
+            version, name, ctr, errors, temp, pres, humi = struct.unpack(b'!BBBx16s', payload)
+        except struct.error as e:
+            raise BadPacketError(e)
+
+        if version != 0x02:
+            raise BadPacketError("received packet with unsupported format version: {version}")
+
+        name = name.rstrip(b'\x00')
+        temp = temp/100 if errors & 0b001 == 0 else None
+        pres = pres/1000 if errors & 0b010 == 0 else None
+        humi = humi/1000 if errors & 0b100 == 0 else None
+        return { name: (temp, pres, humi) }
+
+    @staticmethod
+    def run_udp_listen_thread():
+        global _state
+        global _last_updated
+
+        esp8266_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        esp8266_sock.bind(('', 21772))
+        while True:
+            msg = esp8266_sock.recv(4096)
+            payload = UDPListener.authenticate_message(msg)
+            try:
+                if payload is not None:
+                    with _state_lock:
+                        _state = UDPListener.unpack_message(payload)
+                        _last_updated = datetime.datetime.now()
+                        print('updated state: {}'.format(_state), flush=True)
+            except BadPacketError as e:
+                print(f'error: {e}', file=sys.stderr, flush=True)
+
+
+class RequestHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != '/metrics':
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b'404 not found')
+            return
+
+        with _state_lock:
+            self.send_response(200)
+            self.end_headers()
+
+            self.wfile.write(b'# HELP bme280_temperature Measured temperature from BME280 sensor\n')
+            self.wfile.write(b'# TYPE bme280_temperature gauge\n')
+            self.wfile.write(b'# HELP bme280_pressure Measured pressure from BME280 sensor\n')
+            self.wfile.write(b'# TYPE bme280_pressure gauge\n')
+            self.wfile.write(b'# HELP bme280_humidity Measured humidity from BME280 sensor\n')
+            self.wfile.write(b'# TYPE bme280_humidity gauge\n')
+            if _last_updated != None and _last_updated > datetime.datetime.now() - datetime.timedelta(seconds=DEVICE_LOST_SECONDS):
+                for name, values in _state.items():
+                    if values[0]:
+                        self.wfile.write(b'bme280_temperature{name="%s"} %.2f\n' % (name, values[0]))
+                    if values[1]:
+                        self.wfile.write(b'bme280_pressure{name="%s"} %.3f\n' % (name, values[1]))
+                    if values[2]:
+                        self.wfile.write(b'bme280_humidity{name="%s"} %.3f\n' % (name, values[2]))
+
+
+if __name__ == '__main__':
+    listen_thread = threading.Thread(target=UDPListener.run_udp_listen_thread, name='udp_listen', daemon=True)
+    listen_thread.start()
+
+    http_server = http.server.HTTPServer(('0.0.0.0', 9172), RequestHandler)
+    http_server.serve_forever()
