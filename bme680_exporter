@@ -98,6 +98,9 @@ class UDPListener(object):
 
             for stat, gauge in _stats.items():
                 if stat == 'iaq' or stat == 'static_iaq':
+                    for accuracy in range(4):
+                        remove_ignore_keyerror(gauge, name, accuracy)
+
                     iaq_accuracy = metric_data['iaq_accuracy']
                     labeled_gauge = gauge.labels(
                         name=name, iaq_accuracy=iaq_accuracy)
