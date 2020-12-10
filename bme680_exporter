@@ -1,31 +1,63 @@
 #!/usr/bin/env python3
 
-import base64
 import datetime
+import functools
 import hashlib
 import hmac
 import http.server
 import socket
+from socketserver import DatagramRequestHandler
 import struct
 import sys
 import threading
 
+import prometheus_client
+
+# Current protocol version
+PROTOCOL_VERSION = 0x02
+
 # Use the same key here as in config.lua
-PRESHARED_KEY = base64.decodebytes(b'SECRET_KEY')
+PRESHARED_KEY = b'\x23\x32\xff\x42\xa2\xac\x7a\x40\x9e\x7f\xf2\x8e\x23\x68\x80\x9d\x47\x00\x62\x39\xca\xe9\x5a\xfc\x36\x74\xdb\xa8\xa7\x35\x9b\xda'
 
-# After a timeout of x SECONDS, assume the device is down
-DEVICE_LOST_SECONDS = 10
+# After a timeout of x SECONDS, assume the device is down.
+DEVICE_LOST_SECONDS = 60
 
-_state = {}
-_last_updated = None
+# After a timeout of x SECONDS, assume the device is removed from the pool of devices.
+DEVICE_REMOVED_SECONDS = 3600 * 24
+
+_counters = {}
+_last_updated = {}
 _state_lock = threading.Lock()
+
+
+AppGauge = functools.partial(
+    prometheus_client.Gauge, namespace='bme680', labelnames=['name'])
+IAQGauge = functools.partial(
+    prometheus_client.Gauge, namespace='bme680', labelnames=['name', 'iaq_accuracy'])
+
+_stats = {
+    'up': AppGauge('up', 'Value is 1 if device is broadcasting.'),
+    'bsec_status': AppGauge('bsec_status', 'BSEC status is equal to 0 if the BSEC library is operating OK.'),
+    'iaq': IAQGauge('iaq', 'Indoor Air Quality. (Use for moving sensor.)'),
+    'temperature': AppGauge('temperature_celsius', 'Corrected temperature in degrees Celsius.'),
+    'humidity': AppGauge('humidity_percent', 'Corrected percentage of humidity in the air.'),
+    'pressure': AppGauge('pressure_pascal', 'Air pressure in Pascal.'),
+    'raw_temperature': AppGauge('raw_temperature_celsius', 'Uncorrected temperature in degrees Celsius.'),
+    'raw_humidity': AppGauge('raw_humidity_percent', 'Uncorrected percentage of humidity in the air.'),
+    'gas': AppGauge('gas_resistance_ohm', 'Raw gas resistance measured in ohm.'),
+    'static_iaq': IAQGauge('static_iaq', 'Static Indoor Air Quality. (Use for non-moving sensor.)'),
+    'co2_equivalent': AppGauge('co2_equivalent_ppm', 'Estimated equivalent amount of CO2 in gas in parts per million.'),
+    'breath_voc_equivalent': AppGauge('breath_voc_equivalent_ppm', 'Estimated equivalent amount of volatile organic compounds as found in breath, in parts per million.'),
+}
+
 
 class BadPacketError(Exception):
     pass
 
+
 class UDPListener(object):
     @staticmethod
-    def authenticate_message(message):
+    def check_mac(message):
         if len(message) < 32:
             return None
 
@@ -37,73 +69,106 @@ class UDPListener(object):
         return payload
 
     @staticmethod
-    def unpack_message(payload):
-        version = None
+    def handle_message(payload):
+        global _counters
+        global _last_updated
+        global _state_lock
+
         try:
-            version, name, ctr, errors, temp, pres, humi = struct.unpack(b'!BBBx16s', payload)
+            labels = ['version', 'bsec_status', 'iaq_accuracy', 'name', 'counter', 'iaq', 'temperature', 'humidity',
+                      'pressure', 'raw_temperature', 'raw_humidity', 'gas', 'static_iaq', 'co2_equivalent', 'breath_voc_equivalent']
+            data = struct.unpack(b'<BBBx16sQ10f', payload)
+            metric_data = dict(zip(labels, data))
         except struct.error as e:
-            raise BadPacketError(e)
+            raise BadPacketError(f'struct.unpack error: {e}')
 
-        if version != 0x02:
-            raise BadPacketError("received packet with unsupported format version: {version}")
+        version = metric_data['version']
+        if version != PROTOCOL_VERSION:
+            raise BadPacketError(
+                f'received packet with unsupported format version: {version:02x} (expected: {PROTOCOL_VERSION:02x})')
 
-        name = name.rstrip(b'\x00')
-        temp = temp/100 if errors & 0b001 == 0 else None
-        pres = pres/1000 if errors & 0b010 == 0 else None
-        humi = humi/1000 if errors & 0b100 == 0 else None
-        return { name: (temp, pres, humi) }
+        name = metric_data['name'].decode('utf-8').rstrip('\x00')
+
+        with _state_lock:
+            previous_counter_val = _counters.get(name, -1)
+            if metric_data['counter'] <= previous_counter_val:
+                raise BadPacketError(f'counter value not bumped')
+            _counters[name] = metric_data['counter']
+            # From this point, the payload is fully authenticated.
+
+            for stat, gauge in _stats.items():
+                if stat == 'iaq' or stat == 'static_iaq':
+                    iaq_accuracy = metric_data['iaq_accuracy']
+                    labeled_gauge = gauge.labels(
+                        name=name, iaq_accuracy=iaq_accuracy)
+                else:
+                    labeled_gauge = gauge.labels(name=name)
+
+                if stat == 'up':
+                    labeled_gauge.set(1)
+                    continue
+
+                labeled_gauge.set(metric_data[stat])
+            _last_updated[name] = datetime.datetime.now()
 
     @staticmethod
     def run_udp_listen_thread():
-        global _state
         global _last_updated
 
         esp8266_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        esp8266_sock.bind(('', 21772))
+        esp8266_sock.bind(('', 21773))
         while True:
             msg = esp8266_sock.recv(4096)
-            payload = UDPListener.authenticate_message(msg)
+            payload = UDPListener.check_mac(msg)
             try:
                 if payload is not None:
-                    with _state_lock:
-                        _state = UDPListener.unpack_message(payload)
-                        _last_updated = datetime.datetime.now()
-                        print('updated state: {}'.format(_state), flush=True)
+                    UDPListener.handle_message(payload)
             except BadPacketError as e:
                 print(f'error: {e}', file=sys.stderr, flush=True)
 
 
-class RequestHandler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path != '/metrics':
-            self.send_response(404)
-            self.end_headers()
-            self.wfile.write(b'404 not found')
-            return
-
+class MetricsHandler(prometheus_client.MetricsHandler):
+    def handle_one_request(self):
         with _state_lock:
-            self.send_response(200)
-            self.end_headers()
+            clear_timeout_devices()
+            super().handle_one_request()
 
-            self.wfile.write(b'# HELP bme280_temperature Measured temperature from BME280 sensor\n')
-            self.wfile.write(b'# TYPE bme280_temperature gauge\n')
-            self.wfile.write(b'# HELP bme280_pressure Measured pressure from BME280 sensor\n')
-            self.wfile.write(b'# TYPE bme280_pressure gauge\n')
-            self.wfile.write(b'# HELP bme280_humidity Measured humidity from BME280 sensor\n')
-            self.wfile.write(b'# TYPE bme280_humidity gauge\n')
-            if _last_updated != None and _last_updated > datetime.datetime.now() - datetime.timedelta(seconds=DEVICE_LOST_SECONDS):
-                for name, values in _state.items():
-                    if values[0]:
-                        self.wfile.write(b'bme280_temperature{name="%s"} %.2f\n' % (name, values[0]))
-                    if values[1]:
-                        self.wfile.write(b'bme280_pressure{name="%s"} %.3f\n' % (name, values[1]))
-                    if values[2]:
-                        self.wfile.write(b'bme280_humidity{name="%s"} %.3f\n' % (name, values[2]))
+
+def remove_ignore_keyerror(gauge, *args, **kwargs):
+    try:
+        gauge.remove(*args, **kwargs)
+    except KeyError:
+        pass
+
+
+def clear_timeout_devices():
+    now = datetime.datetime.now()
+    for name, device_last_updated in _last_updated.items():
+        delta_seconds = (now - device_last_updated).total_seconds()
+        if delta_seconds >= DEVICE_LOST_SECONDS:
+            # This device is lost. Purge it from the metrics.
+            for metric, gauge in _stats.items():
+                if metric == 'up' and delta_seconds >= DEVICE_REMOVED_SECONDS:
+                    remove_ignore_keyerror(gauge, name)
+                    _last_updated.pop(name, None)
+                    continue
+                elif metric == 'up':
+                    gauge.labels(name).set(0)
+                    continue
+
+                if metric == 'iaq' or metric == 'static_iaq':
+                    for accuracy in range(4):
+                        remove_ignore_keyerror(gauge, name, accuracy)
+                    continue
+
+                remove_ignore_keyerror(gauge, name)
 
 
 if __name__ == '__main__':
-    listen_thread = threading.Thread(target=UDPListener.run_udp_listen_thread, name='udp_listen', daemon=True)
+    listen_thread = threading.Thread(
+        target=UDPListener.run_udp_listen_thread, name='udp_listen', daemon=True)
     listen_thread.start()
 
-    http_server = http.server.HTTPServer(('0.0.0.0', 9172), RequestHandler)
+    http_server = http.server.HTTPServer(
+        ('0.0.0.0', 9172), MetricsHandler)
     http_server.serve_forever()

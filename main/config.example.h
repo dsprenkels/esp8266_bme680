@@ -7,7 +7,7 @@
 #define CONFIG_WIFI_PASSWORD "mypassword"
 
 // UDP port on which to broadcast the BME680 measurements.
-#define CONFIG_BEACON_PORT 21772
+#define CONFIG_BEACON_PORT 21773
 
 // Temperature compensation offset.
 #define CONFIG_BME680_TEMP_OFFSET 0.28f

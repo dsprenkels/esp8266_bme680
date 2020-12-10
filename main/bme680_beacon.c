@@ -50,7 +50,7 @@
 //          iaq_accuracy        u8
 //          [padding]           u8
 //          name                char[16]
-//          ctr                 u64
+//          counter             u64
 //          iaq                 f32
 //          temperature         f32
 //          humidity            f32
@@ -72,7 +72,7 @@
 //              padded with zero bytes.
 //              examples: "bedroom\0\0\0\0\0\0\0\0\0"/"feynman\0\0\0\0\0\0\0\0\0"
 //
-// ctr:         A 64-bit sequence number. The receiver MUST keep a counter which
+// counter:     A 64-bit sequence number. The receiver MUST keep a counter which
 //              contains the last counter value it has seen from this identifier.
 //              If an HMAC-authenticated packet contains a counter with a value
 //              less than the saved counter, the reciever MUST silently drop the
